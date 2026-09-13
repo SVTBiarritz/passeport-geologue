@@ -1167,51 +1167,183 @@
     });
     body += '<div class="card no-print" style="margin-top:16px;">';
     body += '<p class="eyebrow" style="margin-bottom:8px;">Envoyer le dossier sur le mur Padlet</p>';
-    body += '<p class="lede" style="font-size:13px;margin-top:0;">Étape 1 : enregistrez les photos sur le téléphone. Étape 2 : ouvrez le mur Padlet et déposez-les avec le bouton « + ».</p>';
-    body += '<button class="btn btn-secondary btn-block" id="shareBtn" style="margin-top:6px;">📤 1. Enregistrer les photos sur le téléphone</button>';
+    body += '<p class="lede" style="font-size:13px;margin-top:0;">Étape 1 : générez et enregistrez le dossier (un seul PDF regroupant toutes les photos). Étape 2 : ouvrez le mur Padlet et déposez-le avec le bouton « + ».</p>';
+    body += '<button class="btn btn-secondary btn-block" id="shareBtn" style="margin-top:6px;">📄 1. Générer et enregistrer le dossier (PDF)</button>';
     body += '<a class="btn btn-primary btn-block" href="' + PADLET_URL + '" target="_blank" rel="noopener" style="margin-top:10px;text-decoration:none;">🧷 2. Ouvrir le mur Padlet de la sortie</a>';
     body += '</div>';
     return body;
   }
-  function dataUrlToFile(dataUrl, filename){
-    var parts = dataUrl.split(",");
-    var mimeMatch = parts[0].match(/:(.*?);/);
-    var mime = mimeMatch ? mimeMatch[1] : "image/jpeg";
-    var bstr = atob(parts[1]);
-    var n = bstr.length;
-    var u8arr = new Uint8Array(n);
-    while(n--){ u8arr[n] = bstr.charCodeAt(n); }
-    return new File([u8arr], filename, { type: mime });
-  }
   function collectDossierPhotos(){
-    var files = [];
+    var items = [];
     STAGE_ORDER.forEach(function(key){
-      var s = state.stages[key];
-      if(s.photo) files.push(dataUrlToFile(s.photo, key + "_photo.jpg"));
-      if(s.extraPhotos && s.extraPhotos.length) s.extraPhotos.forEach(function(p, i){ files.push(dataUrlToFile(p, key + "_extra" + (i+1) + ".jpg")); });
-      if(s.maquetteBefore) files.push(dataUrlToFile(s.maquetteBefore, key + "_avant.jpg"));
-      if(s.maquetteAfter) files.push(dataUrlToFile(s.maquetteAfter, key + "_apres.jpg"));
-      if(s.pliBefore) files.push(dataUrlToFile(s.pliBefore, key + "_avant.jpg"));
-      if(s.pliAfter) files.push(dataUrlToFile(s.pliAfter, key + "_apres.jpg"));
+      var meta = STAGE_META[key], s = state.stages[key];
+      if(s.photo) items.push({ label: meta.title, dataUrl: s.photo });
+      if(s.extraPhotos && s.extraPhotos.length) s.extraPhotos.forEach(function(p, i){
+        items.push({ label: meta.title + " \u2014 photo compl\u00e9mentaire " + (i+1), dataUrl: p });
+      });
+      if(s.maquetteBefore) items.push({ label: meta.title + " \u2014 avant la collision", dataUrl: s.maquetteBefore });
+      if(s.maquetteAfter) items.push({ label: meta.title + " \u2014 apr\u00e8s la collision", dataUrl: s.maquetteAfter });
+      if(s.pliBefore) items.push({ label: meta.title + " \u2014 avant le plissement", dataUrl: s.pliBefore });
+      if(s.pliAfter) items.push({ label: meta.title + " \u2014 apr\u00e8s le plissement", dataUrl: s.pliAfter });
     });
-    return files;
+    return items;
+  }
+
+  // ---------- PDF DU DOSSIER (un seul fichier regroupant toutes les photos) ----------
+  function loadImageEl(dataUrl){
+    return new Promise(function(resolve, reject){
+      var img = new Image();
+      img.onload = function(){ resolve(img); };
+      img.onerror = function(){ reject(new Error("image load failed")); };
+      img.src = dataUrl;
+    });
+  }
+  function dataUrlToBytes(dataUrl){
+    var b64 = dataUrl.split(",")[1];
+    var bstr = atob(b64);
+    var n = bstr.length;
+    var bytes = new Uint8Array(n);
+    for(var i=0;i<n;i++){ bytes[i] = bstr.charCodeAt(i); }
+    return bytes;
+  }
+  function composeDossierPage(img, label){
+    var capH = Math.max(48, Math.round(img.naturalWidth * 0.07));
+    var c = document.createElement("canvas");
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight + capH;
+    var ctx = c.getContext("2d");
+    ctx.fillStyle = "#F4F3EA";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = "#1E2A26";
+    ctx.textBaseline = "middle";
+    var fontSize = Math.max(16, Math.round(capH * 0.42));
+    ctx.font = "bold " + fontSize + "px sans-serif";
+    var pad = Math.round(capH * 0.3);
+    var maxW = c.width - pad * 2;
+    var text = label;
+    while(ctx.measureText(text).width > maxW && text.length > 3){
+      text = text.slice(0, -2);
+    }
+    if(text !== label) text = text.slice(0, -1) + "\u2026";
+    ctx.fillText(text, pad, capH / 2);
+    ctx.drawImage(img, 0, capH);
+    return c;
+  }
+  function buildDossierPdfBlob(items){
+    var pages = items.map(function(){ return null; });
+    var chain = Promise.resolve();
+    items.forEach(function(item, idx){
+      chain = chain.then(function(){
+        return loadImageEl(item.dataUrl).then(function(img){
+          var canvas = composeDossierPage(img, item.label);
+          var jpegDataUrl = canvas.toDataURL("image/jpeg", 0.82);
+          pages[idx] = {
+            width: canvas.width,
+            height: canvas.height,
+            bytes: dataUrlToBytes(jpegDataUrl)
+          };
+        });
+      });
+    });
+    return chain.then(function(){ return assemblePdf(pages); });
+  }
+  function assemblePdf(pages){
+    var enc = (typeof TextEncoder !== "undefined") ? new TextEncoder() : null;
+    function strBytes(str){
+      if(enc) return enc.encode(str);
+      var arr = new Uint8Array(str.length);
+      for(var i=0;i<str.length;i++){ arr[i] = str.charCodeAt(i); }
+      return arr;
+    }
+    var chunks = [];
+    var offset = 0;
+    var objOffsets = [];
+    function push(bytes){ chunks.push(bytes); offset += bytes.length; }
+    function pushStr(str){ push(strBytes(str)); }
+    function beginObj(num){ objOffsets[num] = offset; pushStr(num + " 0 obj\n"); }
+    function endObj(){ pushStr("endobj\n"); }
+
+    pushStr("%PDF-1.4\n");
+
+    var pageCount = pages.length;
+    var firstPageObj = 3;
+    var kids = [];
+    for(var i=0;i<pageCount;i++){ kids.push((firstPageObj + i*3) + " 0 R"); }
+
+    beginObj(1);
+    pushStr("<< /Type /Catalog /Pages 2 0 R >>\n");
+    endObj();
+
+    beginObj(2);
+    pushStr("<< /Type /Pages /Kids [" + kids.join(" ") + "] /Count " + pageCount + " >>\n");
+    endObj();
+
+    pages.forEach(function(p, i){
+      var pageObjNum = firstPageObj + i*3;
+      var contentObjNum = pageObjNum + 1;
+      var imageObjNum = pageObjNum + 2;
+
+      beginObj(pageObjNum);
+      pushStr("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + p.width + " " + p.height + "] /Resources << /XObject << /Im0 " + imageObjNum + " 0 R >> >> /Contents " + contentObjNum + " 0 R >>\n");
+      endObj();
+
+      var content = "q\n" + p.width + " 0 0 " + p.height + " 0 0 cm\n/Im0 Do\nQ";
+      beginObj(contentObjNum);
+      pushStr("<< /Length " + content.length + " >>\nstream\n");
+      pushStr(content);
+      pushStr("\nendstream\n");
+      endObj();
+
+      beginObj(imageObjNum);
+      pushStr("<< /Type /XObject /Subtype /Image /Width " + p.width + " /Height " + p.height + " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + p.bytes.length + " >>\nstream\n");
+      push(p.bytes);
+      pushStr("\nendstream\n");
+      endObj();
+    });
+
+    var totalObjects = 2 + pageCount * 3;
+    var xrefOffset = offset;
+    pushStr("xref\n0 " + (totalObjects + 1) + "\n");
+    pushStr("0000000000 65535 f\r\n");
+    for(var n=1;n<=totalObjects;n++){
+      var off = String(objOffsets[n]);
+      while(off.length < 10) off = "0" + off;
+      pushStr(off + " 00000 n\r\n");
+    }
+    pushStr("trailer\n<< /Size " + (totalObjects + 1) + " /Root 1 0 R >>\nstartxref\n" + xrefOffset + "\n%%EOF");
+
+    return new Blob(chunks, { type: "application/pdf" });
   }
   function wireDossier(){
     var back = document.getElementById("backBtn2");
     if(back) back.addEventListener("click", function(){ state.screen = "dashboard"; render(); });
     var shareBtn = document.getElementById("shareBtn");
     if(shareBtn) shareBtn.addEventListener("click", function(){
-      var files = collectDossierPhotos();
-      if(!files.length){ alert("Aucune photo à partager pour l'instant."); return; }
-      if(navigator.canShare && navigator.canShare({ files: files })){
-        navigator.share({
-          files: files,
-          title: "Dossier géologie — " + state.teamName,
-          text: "Photos du dossier géologie (" + state.teamName + ")"
-        }).catch(function(){});
-      } else {
-        alert("Le partage direct n'est pas disponible sur ce navigateur. Ouvrez ce lien pour déposer les photos à la main sur le mur Padlet : " + PADLET_URL);
-      }
+      var items = collectDossierPhotos();
+      if(!items.length){ alert("Aucune photo \u00e0 regrouper pour l'instant."); return; }
+      var originalLabel = shareBtn.textContent;
+      shareBtn.disabled = true;
+      shareBtn.textContent = "\u23f3 G\u00e9n\u00e9ration du dossier\u2026";
+      buildDossierPdfBlob(items).then(function(blob){
+        var filename = "dossier_" + (state.teamName || "equipe").replace(/[^a-z0-9]+/gi, "_") + ".pdf";
+        var file = new File([blob], filename, { type: "application/pdf" });
+        if(navigator.canShare && navigator.canShare({ files: [file] })){
+          return navigator.share({
+            files: [file],
+            title: "Dossier g\u00e9ologie \u2014 " + state.teamName,
+            text: "Dossier g\u00e9ologie (" + state.teamName + ") \u2014 un seul PDF avec toutes les photos"
+          }).catch(function(){});
+        } else {
+          var url = URL.createObjectURL(blob);
+          window.open(url, "_blank");
+          alert("Le partage direct n'est pas disponible sur ce navigateur. Le PDF du dossier vient de s'ouvrir dans un nouvel onglet : enregistrez-le, puis d\u00e9posez-le \u00e0 la main sur le mur Padlet : " + PADLET_URL);
+        }
+      }).catch(function(){
+        alert("La g\u00e9n\u00e9ration du dossier PDF a \u00e9chou\u00e9. R\u00e9essayez, ou contactez votre professeur.");
+      }).then(function(){
+        shareBtn.disabled = false;
+        shareBtn.textContent = originalLabel;
+      });
     });
   }
 
